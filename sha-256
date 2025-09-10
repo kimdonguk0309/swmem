@@ -1,0 +1,88 @@
+"""
+16-EiB Software-Defined Memory SuperComputer
+--------------------------------------------
+USER_CODE 안에 SHA-256 역산(브루트 포스) 코드를 넣어 즉시 실행
+"""
+import mmap, types, sys, struct, ctypes, os, builtins, hashlib, itertools, multiprocessing as mp
+from multiprocessing import Pool
+
+# ---------- 1. 16-EiB 가상 메모리 ----------
+PAGE_SHIFT = 16
+PAGE_SIZE  = 1 << PAGE_SHIFT
+PAGE_MASK  = PAGE_SIZE - 1
+
+class SWMem:
+    _dir = {}
+    @staticmethod
+    def _page_base(va): return va & ~PAGE_MASK
+    @classmethod
+    def _ensure(cls, va):
+        base = cls._page_base(va)
+        if base not in cls._dir:
+            cls._dir[base] = mmap.mmap(-1, PAGE_SIZE,
+                                       prot=mmap.PROT_READ|mmap.PROT_WRITE)
+        return cls._dir[base]
+    @classmethod
+    def read(cls, va, n):
+        data = bytearray()
+        while n:
+            pg  = cls._ensure(va)
+            off = va & PAGE_MASK
+            chunk = min(n, PAGE_SIZE - off)
+            data.extend(pg[off:off+chunk])
+            va += chunk; n -= chunk
+        return bytes(data)
+    @classmethod
+    def write(cls, va, buf):
+        buf = memoryview(buf)
+        while buf:
+            pg  = cls._ensure(va)
+            off = va & PAGE_MASK
+            chunk = min(len(buf), PAGE_SIZE - off)
+            pg[off:off+chunk] = buf[:chunk]
+            buf  = buf[chunk:]; va += chunk
+
+# ---------- 2. SHA-256 역산(브루트 포스) ----------
+TARGET = "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"  # 비트코인 제네시스 블록 해시
+PREFIX = b"block"
+
+def brute_range(start, count):
+    """[start, start+count) 범위에서 역산 시도"""
+    for nonce in range(start, start + count):
+        trial = PREFIX + nonce.to_bytes(8, 'big')
+        digest = hashlib.sha256(trial).hexdigest()
+        if digest == TARGET:
+            return nonce, trial
+    return None
+
+def parallel_brute(workers=mp.cpu_count(), step=1<<28):
+    """16 EiB 메모리에 작업 테이블을 만들고 병렬 브루트 포스"""
+    # 작업 테이블을 16 EiB에 배치
+    tbl_va = 0x4000_0000_0000_0000
+    chunk  = step * 8
+    with Pool(workers) as p:
+        for base in range(0, 1<<40, step):   # 1 TiB 단위로 시도
+            ranges = [(base + i*step, step) for i in range(workers)]
+            result = p.starmap(brute_range, ranges)
+            for r in result:
+                if r:
+                    nonce, preimage = r
+                    SWMem.write(tbl_va, preimage)
+                    print(f"[+] 역산 성공! nonce={nonce}  preimage={preimage}")
+                    return nonce
+    print("[-] 이번 구간에서 발견 실패. 더 큰 범위로 확장 가능.")
+    return None
+
+# ---------- 3. 사용자 코드 ----------
+USER_CODE = """
+print("16 EiB 메모리 위에서 SHA-256 역산 시작...")
+print("대상 해시:", TARGET)
+parallel_brute()
+"""
+
+# ---------- 4. 즉시 실행 ----------
+if __name__ == '__main__':
+    g = {'SWMem': SWMem, 'TARGET': TARGET, 'PREFIX': PREFIX,
+         'parallel_brute': parallel_brute, 'mp': mp}
+    bytecode = compile(USER_CODE, '<16-EiB-SHA256-Crack>', 'exec')
+    exec(bytecode, g)
